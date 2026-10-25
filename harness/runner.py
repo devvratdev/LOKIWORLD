@@ -4,19 +4,19 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-
-from .env import PASS_SCORE
-from .tools import SPECS, TOOLS, TOOL_NAMES, check_args
-
+ 
+from .env import PASS_SCORE, STEP_TOOLS
+from .tools import check_args, tools_for
+ 
 SYSTEM_PROMPT = (
-    "You are an autonomous software engineering agent working in a sandboxed Python project. "
-    "Use the provided tools to read files, edit them and run Python code. "
+    "You are an autonomous quantitative trading agent working in a simulated limit-order-book market. "
+    "Use the provided tools to inspect the market and place orders. "
     "Always respond with tool calls. When the task is complete, call the `finish` tool."
 )
 TRIMMED = "[older tool output removed to save context]"
 TRIMMED_ARGS = '{"note": "arguments removed to save context"}'
-
-
+ 
+ 
 @dataclass
 class Limits:
     max_steps: int = 40            # one step = one model reply
@@ -24,23 +24,23 @@ class Limits:
     max_tool_calls: int = 10       # per reply; extra calls are not run
     context_budget_tokens: int = 48000
     max_output_chars: int = 4000
-
-
+ 
+ 
 class JsonlLog:
     def __init__(self, path):
         self.file = open(path, "a", buffering=1)
-
+ 
     def write(self, record):
         self.file.write(json.dumps(record, default=str) + "\n")
-
+ 
     def close(self):
         self.file.close()
-
-
+ 
+ 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
+ 
+ 
 def show(record):
     """One readable line per step on the terminal (live telemetry)."""
     tools = ",".join(a.get("tool", "?") for a in record["parsed_actions"]) or "-"
@@ -48,16 +48,16 @@ def show(record):
     print(f"[{record['agent']:<6} step {record['step']:>2}] tools={tools:<40} "
           f"reward={reward if reward is not None else '-':<6} state={record['state']['hash']} "
           f"errors={len(record['errors'])}", flush=True)
-
-
+ 
+ 
 # --------------------------------------------------------- context trimming
 def estimate_tokens(messages):
     return len(json.dumps(messages, default=str)) // 4
-
-
+ 
+ 
 def trim_history(messages, budget):
     """Shrink old content until the conversation fits the token budget.
-
+ 
     First old tool outputs are replaced by a short note, then the (possibly large)
     arguments of old tool calls. The latest assistant turn and its results are
     never touched, so the agent always sees what it just did.
@@ -80,36 +80,58 @@ def trim_history(messages, budget):
                 break
         if not shrunk:
             return          # nothing older left to shrink
-
-
+ 
+ 
+def _is_rejected(result):
+    return result.get("status") == "rejected" or result.get("success") is False
+ 
+ 
 # ------------------------------------------------------------ baselines
-def run_scripted(env, task_id, seed, actions, agent, log):
-    """Run a scripted agent (oracle or no-op) through the same env code path as a model."""
+def run_scripted(env, task_id, seed, script, agent, log):
+    """Run a scripted agent (oracle or no-op) through the same Env code path as a model.
+ 
+    `script` is a function(env, task) that plays the episode by calling the env's tool methods.
+    One telemetry record is written per agent step (submit_order / cancel_order).
+    """
     env.reset(task_id, seed)
-    step, final = 0, None
-    for step, (name, args) in enumerate(actions, start=1):
-        text, is_error = env.step(name, args)
-        record = {"timestamp": now(), "agent": agent, "task": task_id, "step": step, "seed": seed,
+    counter = {"step": 0}
+ 
+    def on_entry(entry):
+        if entry["tool"] not in STEP_TOOLS:
+            return
+        counter["step"] += 1
+        result = entry["result"]
+        record = {"timestamp": now(), "agent": agent, "task": task_id, "step": counter["step"], "seed": env.task.seed,
                   "model_input": None, "model_output_raw": None,
-                  "parsed_actions": [{"tool": name, "args": args}], "tool_result": [text],
-                  "errors": [{"kind": "tool_error", "detail": text}] if is_error else [],
+                  "parsed_actions": [{"tool": entry["tool"], "args": entry["arguments"]}],
+                  "tool_result": [json.dumps(result)],
+                  "errors": [{"kind": "tool_error", "detail": json.dumps(result)}] if _is_rejected(result) else [],
                   "state": {"hash": env.state_hash()}, "reward": env.score(), "tokens": 0, "latency_ms": 0}
         log.write(record)
         show(record)
+ 
+    env.listener = on_entry
+    try:
+        script(env, env.task)
+    finally:
+        env.listener = None
+    env.finalize()                  # fire any end-of-episode scenario event before the final score
     final = env.score()
     log.write({"timestamp": now(), "agent": agent, "task": task_id, "event": "episode_end",
-               "seed": seed, "steps": step, "reward": final})
+               "seed": env.task.seed, "steps": counter["step"], "reward": final, "episode_log": env.log})
     return final
-
-
+ 
+ 
 # ---------------------------------------------------------- model episode
 def run_episode(env, task_id, seed, client, append_text, limits, log):
     prompt = env.reset(task_id, seed)
     client.start(env.task)
+    tools = tools_for(env.task)
+    allowed = [t["function"]["name"] for t in tools]
     system = SYSTEM_PROMPT + (("\n\n" + append_text) if append_text else "")
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
     started, termination, finished, steps = None, None, False, 0
-
+ 
     for step in range(1, limits.max_steps + 1):
         if started is not None and time.monotonic() - started >= limits.max_seconds:
             termination = "time_cap"
@@ -121,12 +143,12 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
         remaining = limits.max_seconds - (time.monotonic() - started)
         call_start = time.monotonic()
         steps = step
-        record = {"timestamp": now(), "agent": "model", "task": task_id, "step": step, "seed": seed,
+        record = {"timestamp": now(), "agent": "model", "task": task_id, "step": step, "seed": env.task.seed,
                   "model_input": sent, "model_output_raw": None, "parsed_actions": [], "tool_result": [],
                   "errors": [], "state": {"hash": env.state_hash()}, "reward": None, "tokens": 0, "latency_ms": 0}
-
+ 
         try:
-            reply = client.complete(sent, TOOLS, timeout=max(5, min(120, remaining)))
+            reply = client.complete(sent, tools, timeout=max(5, min(120, remaining)))
         except Exception as exc:    # includes provider errors and context-window overflow
             record["errors"].append({"kind": "model_call_failed", "detail": f"{type(exc).__name__}: {exc}"})
             log.write(record)
@@ -135,7 +157,7 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
             break
         record["latency_ms"] = int((time.monotonic() - call_start) * 1000)
         record["model_output_raw"], record["tokens"] = reply.raw, reply.tokens
-
+ 
         # keep every tool call in the history so each one gets a matching result
         assistant = {"role": "assistant", "content": reply.text}
         if reply.tool_calls:
@@ -143,12 +165,12 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
                                         "function": {"name": c.name, "arguments": c.history_arguments()}}
                                        for c in reply.tool_calls]
         messages.append(assistant)
-
+ 
         if not reply.tool_calls:
             record["errors"].append({"kind": "no_tool_call", "detail": "reply contained no tool call"})
             messages.append({"role": "user", "content": "No tool call was received. Call one of the "
                              "available tools, or call `finish` if you are done."})
-
+ 
         for index, call in enumerate(reply.tool_calls):
             args, parse_error = call.parse()
             record["parsed_actions"].append({"tool": call.name, "args": args, "parse_error": parse_error})
@@ -160,8 +182,8 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
             elif parse_error:
                 result = f"error: {parse_error}"
                 record["errors"].append({"kind": "unparsable_arguments", "detail": call.name})
-            elif call.name not in SPECS:
-                result = f"error: unknown tool '{call.name}'. Available tools: {', '.join(TOOL_NAMES)}"
+            elif call.name not in allowed:
+                result = f"error: unknown tool '{call.name}'. Available tools: {', '.join(allowed)}"
                 record["errors"].append({"kind": "unknown_tool", "detail": call.name})
             elif (problem := check_args(call.name, args)):
                 result = f"error: {problem}"
@@ -175,25 +197,27 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
             result = result[:limits.max_output_chars]
             record["tool_result"].append(result)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-
+ 
         record["state"] = {"hash": env.state_hash()}
-        record["reward"] = env.score()
+        record["reward"] = env.score()                      # running score from verify()
         log.write(record)
         show(record)
         if finished:
             break
     else:
         termination = "step_cap"
-
+ 
     try:
+        env.finalize()                                      # pending end-of-episode events fire here
         final = env.score()
     except Exception as exc:
         final = {"total": None, "error": str(exc)}
         termination = termination or "crash"
     if termination is None:
         termination = "success" if (final["total"] or 0) >= PASS_SCORE else "failure"
-    log.write({"timestamp": now(), "agent": "model", "task": task_id, "event": "episode_end", "seed": seed,
-               "steps": steps, "termination": termination, "reward": final,
+    log.write({"timestamp": now(), "agent": "model", "task": task_id, "event": "episode_end", "seed": env.task.seed,
+               "steps": steps, "termination": termination, "reward": final, "episode_log": env.log,
                "elapsed_s": round(time.monotonic() - started, 1) if started else 0})
     return {"termination": termination, "steps": steps, "reward": final,
             "elapsed_s": round(time.monotonic() - started, 1) if started else 0}
+ 

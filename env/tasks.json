@@ -1,0 +1,305 @@
+{
+  "version": 1,
+  "initial_state": {
+    "cash": 100000,
+    "holdings": 0
+  },
+  "metric_definitions": {
+    "arrival_mid": "(best_bid + best_ask) / 2 of the order book immediately after reset (before any setup action).",
+    "filled_buy_quantity": "Total shares bought across all of the agent's fills.",
+    "total_filled_volume": "Total shares filled across the agent's buys and sells.",
+    "implementation_shortfall_usd": "sum(fill_price * fill_quantity) over the agent's buy fills minus filled_buy_quantity * arrival_mid.",
+    "max_fill_price_over_arrival_mid": "max(fill_price over the agent's buy fills) - arrival_mid.",
+    "peak_abs_holdings": "max(abs(holdings)) observed after any agent step.",
+    "final_holdings": "Share holdings when the episode ends.",
+    "equity_loss_usd": "100000 - total_value from get_portfolio at episode end (mark-to-market at book mid).",
+    "agent_steps": "env.step_count minus the number of setup actions executed by the harness."
+  },
+  "tasks": [
+    {
+      "task_id": "demo_task",
+      "tier": 1,
+      "tier_name": "Execution",
+      "title": "Demo: buy 100 shares cheaply",
+      "seed": 1,
+      "max_steps": 3,
+      "tools": [
+        "get_market_depth",
+        "submit_order",
+        "cancel_order",
+        "get_portfolio"
+      ],
+      "prompt": "Buy exactly 100 shares. Keep your implementation shortfall at or below $10, where implementation shortfall = total dollars paid minus 100 x the arrival mid price (the midpoint of the best bid and best ask before you trade). You have at most 3 steps (each submit_order or cancel_order call is one step). Inspect the book first.",
+      "setup_actions": [],
+      "scenario_events": [],
+      "success_criteria": [
+        {
+          "metric": "filled_buy_quantity",
+          "operator": "==",
+          "value": 100
+        },
+        {
+          "metric": "implementation_shortfall_usd",
+          "operator": "<=",
+          "value": 10
+        },
+        {
+          "metric": "agent_steps",
+          "operator": "<=",
+          "value": 3
+        }
+      ],
+      "reference": {
+        "arrival_mid": 92.69,
+        "single_market_order": {
+          "implementation_shortfall_usd": 5.93,
+          "agent_steps": 1
+        },
+        "note": "Best ask holds 220 shares, so one market order fills at the top of the book."
+      }
+    },
+    {
+      "task_id": "t1_block_buy_500",
+      "tier": 1,
+      "tier_name": "Execution",
+      "title": "Block buy of 500 shares with a slippage budget",
+      "seed": 6,
+      "max_steps": 8,
+      "tools": [
+        "get_market_depth",
+        "submit_order",
+        "cancel_order",
+        "get_portfolio"
+      ],
+      "prompt": "Buy exactly 500 shares. Your implementation shortfall must not exceed $70, where implementation shortfall = total dollars paid minus 500 x the arrival mid price (the midpoint of the best bid and best ask before you trade). Slippage grows with every book level a single order walks through, so consider how you size and price your orders. You have at most 8 steps (each submit_order or cancel_order call is one step).",
+      "setup_actions": [],
+      "scenario_events": [],
+      "success_criteria": [
+        {
+          "metric": "filled_buy_quantity",
+          "operator": "==",
+          "value": 500
+        },
+        {
+          "metric": "implementation_shortfall_usd",
+          "operator": "<=",
+          "value": 70
+        },
+        {
+          "metric": "agent_steps",
+          "operator": "<=",
+          "value": 8
+        }
+      ],
+      "reference": {
+        "arrival_mid": 105.87,
+        "single_market_order": {
+          "implementation_shortfall_usd": 75.85,
+          "agent_steps": 1,
+          "passes": false
+        },
+        "one_limit_order_per_level": {
+          "implementation_shortfall_usd": 62.3,
+          "agent_steps": 4,
+          "passes": true
+        }
+      }
+    },
+    {
+      "task_id": "t1_limit_discipline_buy_800",
+      "tier": 1,
+      "tier_name": "Execution",
+      "title": "Large buy under a price ceiling and step budget",
+      "seed": 4,
+      "max_steps": 5,
+      "tools": [
+        "get_market_depth",
+        "submit_order",
+        "cancel_order",
+        "get_portfolio"
+      ],
+      "prompt": "Buy exactly 800 shares. Constraints: (1) implementation shortfall at or below $128, where implementation shortfall = total dollars paid minus 800 x the arrival mid price (the midpoint of the best bid and best ask before you trade); (2) no individual fill may be priced more than $0.25 above the arrival mid; (3) at most 5 steps (each submit_order or cancel_order call is one step). Execution prices include slippage that grows with the number of book levels an order walks through.",
+      "setup_actions": [],
+      "scenario_events": [],
+      "success_criteria": [
+        {
+          "metric": "filled_buy_quantity",
+          "operator": "==",
+          "value": 800
+        },
+        {
+          "metric": "implementation_shortfall_usd",
+          "operator": "<=",
+          "value": 128
+        },
+        {
+          "metric": "max_fill_price_over_arrival_mid",
+          "operator": "<=",
+          "value": 0.25
+        },
+        {
+          "metric": "agent_steps",
+          "operator": "<=",
+          "value": 5
+        }
+      ],
+      "reference": {
+        "arrival_mid": 94.72,
+        "single_market_order": {
+          "implementation_shortfall_usd": 141.92,
+          "max_fill_price_over_arrival_mid": 0.2664,
+          "agent_steps": 1,
+          "passes": false
+        },
+        "one_limit_order_per_level": {
+          "implementation_shortfall_usd": 116,
+          "max_fill_price_over_arrival_mid": 0.2095,
+          "agent_steps": 4,
+          "passes": true
+        }
+      }
+    },
+    {
+      "task_id": "t2_inventory_capped_churn",
+      "tier": 2,
+      "tier_name": "Market Making / Hedging",
+      "title": "Delta-neutral inventory cycling under a position cap",
+      "seed": 36,
+      "max_steps": 10,
+      "tools": [
+        "get_market_depth",
+        "submit_order",
+        "cancel_order",
+        "get_portfolio"
+      ],
+      "prompt": "You are running a flow desk that must stay close to delta-neutral. Trade at least 1,000 shares of total volume (buys plus sells), never let your absolute position exceed 400 shares after any step, and finish completely flat (0 shares). Your total equity loss (100,000 minus final portfolio value) must not exceed $112. You have at most 10 steps (each submit_order or cancel_order call is one step). Short selling is not allowed.",
+      "setup_actions": [],
+      "scenario_events": [],
+      "success_criteria": [
+        {
+          "metric": "total_filled_volume",
+          "operator": ">=",
+          "value": 1000
+        },
+        {
+          "metric": "peak_abs_holdings",
+          "operator": "<=",
+          "value": 400
+        },
+        {
+          "metric": "final_holdings",
+          "operator": "==",
+          "value": 0
+        },
+        {
+          "metric": "equity_loss_usd",
+          "operator": "<=",
+          "value": 112
+        },
+        {
+          "metric": "agent_steps",
+          "operator": "<=",
+          "value": 10
+        }
+      ],
+      "reference": {
+        "plan": "buy 400, sell 400, buy 100, sell 100",
+        "market_orders_only": {
+          "equity_loss_usd": 117.57,
+          "agent_steps": 4,
+          "passes": false
+        },
+        "one_limit_order_per_level": {
+          "equity_loss_usd": 105.61,
+          "agent_steps": 7,
+          "passes": true
+        }
+      }
+    },
+    {
+      "task_id": "t2_volatility_shock_liquidation",
+      "tier": 2,
+      "tier_name": "Market Making / Hedging",
+      "title": "Survive a volatility shock with inherited inventory",
+      "seed": 22,
+      "max_steps": 8,
+      "tools": [
+        "get_market_depth",
+        "submit_order",
+        "cancel_order",
+        "get_portfolio"
+      ],
+      "prompt": "You have inherited a long position in the stock. Volatility is elevated and a sudden gap move can hit the market without warning. Capital preservation is the mandate: finish flat (0 shares) with total equity loss (100,000 minus final portfolio value) no greater than $400, using at most 8 steps (each submit_order or cancel_order call is one step). Check your portfolio and the book before acting. Short selling is not allowed.",
+      "setup_actions": [
+        {
+          "tool": "submit_order",
+          "arguments": {
+            "side": "buy",
+            "quantity": 800,
+            "price": null
+          }
+        }
+      ],
+      "scenario_events": [
+        {
+          "type": "volatility_shock",
+          "trigger": {
+            "after_agent_steps": 3,
+            "fire_at_episode_end_if_pending": true
+          },
+          "disclosed_to_agent": false,
+          "effect": {
+            "price_multiplier": 0.92,
+            "quantity_multiplier": 0.5,
+            "apply_to": [
+              "bids",
+              "asks"
+            ],
+            "price_rounding_decimals": 2,
+            "min_level_quantity": 1
+          }
+        }
+      ],
+      "success_criteria": [
+        {
+          "metric": "final_holdings",
+          "operator": "==",
+          "value": 0
+        },
+        {
+          "metric": "equity_loss_usd",
+          "operator": "<=",
+          "value": 400
+        },
+        {
+          "metric": "agent_steps",
+          "operator": "<=",
+          "value": 8
+        }
+      ],
+      "reference": {
+        "arrival_mid": 109.16,
+        "setup_note": "The harness runs the setup market buy of 800 shares before handing control to the agent; it does not count toward agent_steps.",
+        "single_market_sell_800": {
+          "equity_loss_usd": 195.35,
+          "agent_steps": 1,
+          "passes": true
+        },
+        "two_market_sells_400": {
+          "equity_loss_usd": 186.63,
+          "agent_steps": 2,
+          "passes": true
+        },
+        "one_limit_order_per_level_sells": {
+          "equity_loss_usd": 917.93,
+          "note": "Needs 4 orders; the shock lands after the 3rd, so the remainder is sold into a gapped, thinner book.",
+          "passes": false
+        },
+        "do_nothing": {
+          "equity_loss_usd": 7053.53,
+          "passes": false
+        }
+      }
+    }
+  ]
+}

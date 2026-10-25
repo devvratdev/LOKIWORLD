@@ -1,14 +1,19 @@
 """Entry point. One command runs everything:
-
+ 
     docker compose up --build --abort-on-container-exit --exit-code-from harness
-
+ 
 Order of events:
-    1. build the images and start the sandbox          (docker compose)
-    2. oracle check   reference solution must score full marks
+    1. build the image(s)                              (docker compose)
+    2. oracle check   reference solution (env/reference.py) must score full marks
     3. no-op check    an agent that gives up must score about zero
     4. model run      only if both checks passed
-
+ 
 MODE=full runs TASK_ID; MODE=all runs every task in turn; MODE=baselines stops after the checks.
+ 
+The trading environment runs inside this process (env/env.py), so there is no sandbox
+service to wait for. Each task in env/tasks.json carries its own seed, which is passed to
+TradingEnv.reset(seed). SEED_OVERRIDE (optional) replaces it for every task; leave it unset
+for the thresholds in tasks.json to stay calibrated.
 """
 import hashlib
 import json
@@ -16,35 +21,22 @@ import os
 import sys
 import time
 from pathlib import Path
-
-import requests
-
-from .agents import make_client, noop_actions, oracle_actions
+ 
+from .agents import make_client, run_noop, run_oracle
 from .env import Env, PASS_SCORE
 from .runner import JsonlLog, Limits, now, run_episode, run_scripted
 from .tasks import DEMO_TASK, TASKS, build_task
-
+ 
 ORACLE_MIN = PASS_SCORE      # reference solution must reach this
 NOOP_MAX = 0.05              # no-op agent must stay at or below this
 MODES = ("full", "all", "baselines")
 GATE_BUDGET_SECONDS = 120    # oracle + no-op for one task; build gets 3 min, so 5 min in total
-
-
+ 
+ 
 def setting(name, default=""):
     return os.environ.get(name, default) or default
-
-
-def wait_for_sandbox(url, seconds=60):
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        try:
-            if requests.get(url + "/health", timeout=2).ok:
-                return
-        except requests.RequestException:
-            time.sleep(1)
-    raise RuntimeError(f"sandbox at {url} did not become ready")
-
-
+ 
+ 
 def run_gate(env, task_ids, seed, log_path):
     """Oracle first, then no-op, for each task. Returns (passed, rows)."""
     log = JsonlLog(log_path)
@@ -52,23 +44,23 @@ def run_gate(env, task_ids, seed, log_path):
     print("\n== Checks before the model run ==", flush=True)
     for task_id in task_ids:
         task = build_task(task_id, seed)
-        oracle = run_scripted(env, task_id, seed, oracle_actions(task), "oracle", log)["total"]
-        noop = run_scripted(env, task_id, seed, noop_actions(task), "noop", log)["total"]
+        oracle = run_scripted(env, task_id, seed, run_oracle, "oracle", log)["total"]
+        noop = run_scripted(env, task_id, seed, run_noop, "noop", log)["total"]
         row = {"task": task_id, "difficulty": task.difficulty, "oracle": oracle, "noop": noop,
                "oracle_ok": oracle >= ORACLE_MIN, "noop_ok": noop <= NOOP_MAX}
         rows.append(row)
-        print(f"{task_id:<18} oracle {oracle:.2f} {'PASS' if row['oracle_ok'] else 'FAIL'}   "
+        print(f"{task_id:<34} oracle {oracle:.2f} {'PASS' if row['oracle_ok'] else 'FAIL'}   "
               f"no-op {noop:.2f} {'PASS' if row['noop_ok'] else 'FAIL'}", flush=True)
     log.close()
     return all(r["oracle_ok"] and r["noop_ok"] for r in rows), rows
-
-
+ 
+ 
 INPUTS = Path("inputs")
-
-
+ 
+ 
 def load_append(name):
     """Return (text, info) for the extra system-prompt instructions, or raise ValueError.
-
+ 
     APPEND_FILE names a file inside inputs/ (the only host folder mounted into the harness).
     When it is unset, inputs/append.txt is used if present. A file that is named but missing,
     empty or unreadable is an error rather than a silent no-op: a run that quietly went
@@ -98,18 +90,24 @@ def load_append(name):
     info = {"file": f"inputs/{name}", "chars": len(text),
             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
     return text, info
-
-
+ 
+ 
 def main():
-    url = setting("SANDBOX_URL", "http://sandbox:8000")
     model, api_key, base_url = setting("MODEL", "mock/solver"), setting("API_KEY"), setting("BASE_URL") or None
     task_id, mode = setting("TASK_ID", DEMO_TASK), setting("MODE", "full")
-    seed = int(setting("SEED", "0"))
     run_id = time.strftime("%Y%m%d-%H%M%S")
     out = Path("logs") / run_id
     out.mkdir(parents=True, exist_ok=True)
     limits = Limits(max_steps=int(setting("MAX_STEPS", "40")), max_seconds=int(setting("MAX_SECONDS", "600")))
-
+ 
+    try:
+        override = setting("SEED_OVERRIDE").strip()
+        seed = int(override) if override else None          # None = use each task's own seed
+    except ValueError:
+        print(f"configuration error: SEED_OVERRIDE must be an integer, got '{setting('SEED_OVERRIDE')}'")
+        return 3
+    seed_label = seed if seed is not None else "per task (tasks.json)"
+ 
     if mode not in MODES:
         print(f"unknown MODE '{mode}'. Available: {', '.join(MODES)}")
         return 3
@@ -133,13 +131,8 @@ def main():
               flush=True)
     elif mode != "baselines":
         print("extra instructions: none", flush=True)
-
-    try:
-        wait_for_sandbox(url)
-    except RuntimeError as exc:
-        print(f"error: {exc}")
-        return 1
-    env = Env(url)
+ 
+    env = Env()
     task_ids = [task_id] if mode == "full" else list(TASKS)
     gate_started = time.monotonic()
     passed, rows = run_gate(env, task_ids, seed, out / "gate.jsonl")
@@ -148,26 +141,26 @@ def main():
     if mode == "full" and gate_seconds > GATE_BUDGET_SECONDS:
         print(f"WARNING: checks exceeded the {GATE_BUDGET_SECONDS}s budget for the live run", flush=True)
     (out / "gate.json").write_text(json.dumps(
-        {"seed": seed, "passed": passed, "gate_seconds": gate_seconds, "tasks": rows}, indent=2))
-
+        {"seed": seed_label, "passed": passed, "gate_seconds": gate_seconds, "tasks": rows}, indent=2))
+ 
     if mode == "baselines":
         print(f"\nbaseline results: {'all checks passed' if passed else 'SOME CHECKS FAILED'}  ->  {out}/gate.json")
         return 0 if passed else 2
     if not passed:
-        summary = {"run_id": run_id, "status": "gate_failed", "mode": mode, "tasks": task_ids, "seed": seed,
+        summary = {"run_id": run_id, "status": "gate_failed", "mode": mode, "tasks": task_ids, "seed": seed_label,
                    "model_called": False}
         (out / "summary.json").write_text(json.dumps(summary, indent=2))
         print("\nA baseline check failed, so the model was not called. See gate.json.")
         return 2
-
+ 
     if mode == "full":
         result = run_model(env, task_id, seed, client, model, append_text, limits, out / "episode.jsonl")
-        summary = {"run_id": run_id, "status": "completed", "task": task_id, "seed": seed, "model": model,
+        summary = {"run_id": run_id, "status": "completed", "task": task_id, "seed": seed_label, "model": model,
                    "model_called": True, "append": append_info, "finished_at": now(), **result}
         (out / "summary.json").write_text(json.dumps(summary, indent=2))
         print(f"logs: {out}", flush=True)
         return 1 if result["termination"] == "crash" else 0
-
+ 
     # mode == "all": every task in turn, each with its own step and time limits
     results = {}
     for tid in task_ids:
@@ -179,7 +172,7 @@ def main():
             results[tid] = {"termination": "crash", "steps": 0, "reward": {"total": None},
                             "error": f"{type(exc).__name__}: {exc}"}
     totals = [r["reward"].get("total") or 0 for r in results.values()]
-    summary = {"run_id": run_id, "status": "completed", "mode": "all", "seed": seed, "model": model,
+    summary = {"run_id": run_id, "status": "completed", "mode": "all", "seed": seed_label, "model": model,
                "model_called": True, "append": append_info, "finished_at": now(),
                "solved": sum(r["termination"] == "success" for r in results.values()),
                "mean_reward": round(sum(totals) / len(totals), 3), "tasks": results}
@@ -187,15 +180,16 @@ def main():
     print("\n== All tasks ==", flush=True)
     for tid, r in results.items():
         total = r["reward"].get("total")
-        print(f"{tid:<18} {r['termination']:<9} reward {total if total is not None else '-':<6} "
+        print(f"{tid:<34} {r['termination']:<9} reward {total if total is not None else '-':<6} "
               f"steps {r['steps']}", flush=True)
     print(f"solved {summary['solved']}/{len(results)}   mean reward {summary['mean_reward']}   logs: {out}",
           flush=True)
     return 1 if any(r["termination"] == "crash" for r in results.values()) else 0
-
-
+ 
+ 
 def run_model(env, task_id, seed, client, model, append_text, limits, log_path):
-    print(f"\n== Model run: {model}  task={task_id}  seed={seed} ==", flush=True)
+    print(f"\n== Model run: {model}  task={task_id}  seed={seed if seed is not None else 'from tasks.json'} ==",
+          flush=True)
     log = JsonlLog(log_path)
     try:
         result = run_episode(env, task_id, seed, client, append_text, limits, log)
@@ -204,7 +198,8 @@ def run_model(env, task_id, seed, client, model, append_text, limits, log_path):
     print(f"\ntermination: {result['termination']}   reward: {result['reward']}   steps: {result['steps']}",
           flush=True)
     return result
-
-
+ 
+ 
 if __name__ == "__main__":
     sys.exit(main())
+ 

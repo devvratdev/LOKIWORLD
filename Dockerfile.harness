@@ -12,4 +12,5 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 COPY harness ./harness
+COPY env ./env
 CMD ["python", "-m", "harness.run"]
